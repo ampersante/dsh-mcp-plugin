@@ -94,9 +94,14 @@ try {
 	cpSync(staged, target, { recursive: true });
 	swapped = true;
 
-	if (existsSync(patch)) writeFileSync(patch, readFileSync(patch));
-	console.log(`installed ${version}${current ? ` (was ${current})` : ""} -> ${target}`);
-	console.log("profile reload touched:", patch);
+	if (existsSync(patch)) {
+		writeFileSync(patch, readFileSync(patch));
+		console.log(`installed ${version}${current ? ` (was ${current})` : ""} -> ${target}`);
+		console.log("profile reload touched:", patch);
+	} else {
+		console.log(`installed ${version}${current ? ` (was ${current})` : ""} -> ${target}`);
+		console.log("profile patch not found, reload not triggered:", patch);
+	}
 } catch (error) {
 	if (swapped) {
 		rmSync(target, { recursive: true, force: true });
