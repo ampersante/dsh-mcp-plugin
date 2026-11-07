@@ -78,3 +78,7 @@ listener shutdown), client metadata, and the dependency-free guarantee.
 - The plugin is a fork of `dsh-mcp-client`; a DeepSeek Harness update may require re-applying the
   transport patch.
 - The code exchange is verified against ClickUp; it has no automated integration test yet.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
