@@ -37,7 +37,18 @@ function git(...args) {
 	return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
+function refresh() {
+	const remotes = git("remote");
+	if (!remotes) return;
+	try {
+		execFileSync("git", ["-C", repo, "fetch", "--tags", "--prune", "--quiet"], { stdio: "pipe" });
+	} catch (error) {
+		console.error(`warning: could not fetch from the remote (${String(error.message ?? error).split("\n")[0]}); using local tags`);
+	}
+}
+
 function tags() {
+	refresh();
 	return git("tag", "--list", "v*")
 		.split("\n")
 		.filter(Boolean)
@@ -81,10 +92,10 @@ const backup = `${target}.backup-${Date.now()}`;
 let swapped = false;
 
 try {
-	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, "pkg"], { maxBuffer: 64 * 1024 * 1024 });
+	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, "index.js", "oauth.js", "package.json", "test"], { maxBuffer: 64 * 1024 * 1024 });
 	execFileSync("tar", ["-x", "-C", staging], { input: archive });
-	const staged = join(staging, "pkg");
-	if (!existsSync(join(staged, "package.json"))) throw new Error(`ref ${ref} does not contain pkg/`);
+	const staged = staging;
+	if (!existsSync(join(staged, "package.json"))) throw new Error(`ref ${ref} does not contain package.json`);
 
 	console.log(`testing ${ref} with ${node}`);
 	execFileSync(node, ["--test"], { cwd: staged, stdio: "inherit" });
