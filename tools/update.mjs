@@ -56,12 +56,20 @@ function tags() {
 }
 
 function compare(a, b) {
-	const pa = a.split(".").map(Number);
-	const pb = b.split(".").map(Number);
+	const parse = (value) => value.split("-")[0].split(".").map((part) => {
+		const n = Number(part);
+		return Number.isFinite(n) ? n : 0;
+	});
+	const pa = parse(a);
+	const pb = parse(b);
 	for (let i = 0; i < 3; i += 1) {
 		const d = (pa[i] ?? 0) - (pb[i] ?? 0);
 		if (d !== 0) return d;
 	}
+	// A prerelease sorts below its release.
+	const preA = a.includes("-");
+	const preB = b.includes("-");
+	if (preA !== preB) return preA ? -1 : 1;
 	return 0;
 }
 
@@ -101,16 +109,16 @@ try {
 	execFileSync(node, ["--test"], { cwd: staged, stdio: "inherit" });
 
 	if (existsSync(target)) renameSync(target, backup);
+	swapped = true;
 	mkdirSync(join(target, ".."), { recursive: true });
 	cpSync(staged, target, { recursive: true });
-	swapped = true;
 
 	if (existsSync(patch)) {
 		writeFileSync(patch, readFileSync(patch));
-		console.log(`installed ${version}${current ? ` (was ${current})` : ""} -> ${target}`);
+		console.log(`installed ${installedVersion() ?? version}${current ? ` (was ${current})` : ""} -> ${target}`);
 		console.log("profile reload touched:", patch);
 	} else {
-		console.log(`installed ${version}${current ? ` (was ${current})` : ""} -> ${target}`);
+		console.log(`installed ${installedVersion() ?? version}${current ? ` (was ${current})` : ""} -> ${target}`);
 		console.log("profile patch not found, reload not triggered:", patch);
 	}
 } catch (error) {
@@ -121,6 +129,7 @@ try {
 	} else {
 		console.error(`update failed before install: ${String(error.message ?? error)}`);
 	}
+	if (existsSync(backup)) console.error(`previous copy kept at ${backup}`);
 	process.exitCode = 1;
 } finally {
 	rmSync(staging, { recursive: true, force: true });

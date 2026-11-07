@@ -7,43 +7,51 @@
  *
  * Invariants:
  * - the callback listener exists only while an authorization is pending and is
- *   closed the moment the last flow finishes, so no port stays open;
- * - one authorization per server at a time: reconnects reuse the pending flow
- *   and never open a second browser window;
+ *   closed when the last flow finishes;
+ * - one authorization per server at a time; a flow already under way is reused,
+ *   never restarted, and never opens a second browser window;
  * - the port is reserved before the browser opens, so a busy port is an error
  *   rather than a dead end after consent;
  * - the callback accepts GET only, from loopback, with a constant-time `state`
- *   check and a bounded query, and answers with `no-store`;
- * - credentials live in the Keychain, with a `0600` file fallback when the
- *   Keychain is unavailable (headless launch, locked keychain, sandboxed app).
+ *   check, a bounded query, escaped markup, and `no-store`;
+ * - credentials live in the Keychain, with a `0600` file fallback; writes merge
+ *   under a queue so a stale provider cannot erase a token written by another;
+ * - revoking a credential removes every copy, not just the preferred one.
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-/** Loaded on demand so the module can be imported (and tested) without the SDK. */
-let sdkAuth;
-async function loadAuth() {
-	sdkAuth ??= (await import("@modelcontextprotocol/client")).auth;
-	return sdkAuth;
-}
 
 const KEYCHAIN_SERVICE = "dsh-mcp-oauth";
 const DEFAULT_CALLBACK_PORT = 8765;
-const CALLBACK_TIMEOUT_MS = Number(process.env.DSH_MCP_OAUTH_TIMEOUT_MS ?? 10 * 60 * 1000);
 const MAX_QUERY_BYTES = 8192;
 const LOG_DEDUPE_MS = 10 * 60 * 1000;
+const SECURITY_TIMEOUT_MS = 15000;
 const STATE_PATH = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "mcp-oauth");
+
+function timeoutMs() {
+	const raw = Number(process.env.DSH_MCP_OAUTH_TIMEOUT_MS ?? 10 * 60 * 1000);
+	return Number.isFinite(raw) && raw > 0 ? raw : 10 * 60 * 1000;
+}
 
 const EMPTY_STATE = () => ({
 	clientInformation: null,
 	tokens: null,
 	codeVerifier: null,
 	discoveryState: null,
-	authorizationServerUrl: null
+	authorizationServerUrl: null,
+	resourceUrl: null
 });
+
+/** Loaded on demand so the module can be imported (and tested) without the SDK. */
+let sdkAuth;
+async function loadAuth() {
+	sdkAuth ??= (await import("@modelcontextprotocol/client")).auth;
+	return sdkAuth;
+}
 
 /**
  * Module state hangs off a global symbol: the harness reloads plugin modules on
@@ -67,15 +75,28 @@ function log(key, message) {
 	console.error(`[dsh-mcp-oauth] ${message}`);
 }
 
+/** Run a helper with a deadline; a hung `security` must not hang the plugin. */
 function run(command, args, input) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
+		let settled = false;
+		const finish = (fn, value) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			fn(value);
+		};
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			finish(reject, new Error(`${command} timed out after ${SECURITY_TIMEOUT_MS}ms`));
+		}, SECURITY_TIMEOUT_MS);
+		timer.unref?.();
 		child.stdout.on("data", (chunk) => stdout += chunk);
 		child.stderr.on("data", (chunk) => stderr += chunk);
-		child.on("error", reject);
-		child.on("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`${command} exited ${code}: ${stderr.trim()}`)));
+		child.on("error", (error) => finish(reject, error));
+		child.on("close", (code) => code === 0 ? finish(resolve, stdout) : finish(reject, new Error(`${command} exited ${code}: ${stderr.trim()}`)));
 		child.stdin.on("error", () => {});
 		child.stdin.end(input ?? "");
 	});
@@ -126,16 +147,28 @@ async function writeSecret(account, value) {
 	const encoded = Buffer.from(value, "utf8").toString("base64");
 	try {
 		await run("security", ["-i"], `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${account} -w ${encoded}\n`);
-		return;
+		return "keychain";
 	} catch (error) {
 		await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
 		const target = join(STATE_PATH, `${account}.json`);
 		const temporary = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-		await writeFile(temporary, value, { mode: 0o600 });
-		await chmod(temporary, 0o600);
-		await rename(temporary, target);
+		try {
+			await writeFile(temporary, value, { mode: 0o600 });
+			await chmod(temporary, 0o600);
+			await rename(temporary, target);
+		} finally {
+			await rm(temporary, { force: true }).catch(() => {});
+		}
 		log(`store:${account}`, `${account}: Keychain unavailable (${String(error).split("\n")[0]}); credentials kept at ${target} with mode 0600`);
+		return "file";
 	}
+}
+
+/** Revocation must remove every copy: a surviving file would resurrect the secret. */
+async function clearSecret(account) {
+	const path = join(STATE_PATH, `${account}.json`);
+	await rm(path, { force: true }).catch(() => {});
+	await run("security", ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account]).catch(() => {});
 }
 
 /** Serialize writes per account so two concurrent saves cannot interleave. */
@@ -153,10 +186,17 @@ function equalState(expected, received) {
 	return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/**
- * The callback listener. It binds on the first pending authorization, keeps
- * serving while any flow is pending, and closes when the last one finishes.
- */
+function escapeHtml(value) {
+	return String(value).replace(/[&<>"']/g, (character) => ({
+		"&": "&amp;",
+		"<": "&lt;",
+		">": "&gt;",
+		'"': "&quot;",
+		"'": "&#39;"
+	})[character]);
+}
+
+/** The callback listener. It serves while any flow is pending, then closes. */
 export class CallbackHub {
 	constructor(port) {
 		this.port = port;
@@ -167,9 +207,9 @@ export class CallbackHub {
 	}
 
 	async ensure() {
-		if (this.error) throw this.error;
 		if (this.server) return this.server;
 		if (this.binding) return this.binding;
+		this.error = null;
 		this.binding = new Promise((resolve, reject) => {
 			const server = createServer((request, response) => this.#handle(request, response));
 			server.on("error", (error) => {
@@ -190,14 +230,20 @@ export class CallbackHub {
 	}
 
 	releaseIfIdle() {
-		this.#release();
+		if (this.pending.size > 0) return;
+		const server = this.server;
+		this.server = null;
+		this.binding = null;
+		if (!server) return;
+		server.closeAllConnections?.();
+		server.close(() => {});
 	}
 
-	/** Stop the listener and reject everything still waiting (used on reload and in tests). */
+	/** Stop the listener and reject everything still waiting (reload, tests). */
 	async close() {
 		for (const entry of this.pending.values()) {
 			clearTimeout(entry.timer);
-			entry.reject(new Error("callback listener closed"));
+			entry.reject?.(new Error("callback listener closed"));
 		}
 		this.pending.clear();
 		const server = this.server;
@@ -208,31 +254,32 @@ export class CallbackHub {
 		await new Promise((resolve) => server.close(resolve));
 	}
 
-	#release() {
-		if (this.pending.size > 0) return;
-		const server = this.server;
-		this.server = null;
-		this.binding = null;
-		if (!server) return;
-		server.closeAllConnections?.();
-		server.close(() => {});
-	}
-
-	register(serverName, state) {
+	/**
+	 * A second registration for the same server would silently orphan the first
+	 * timer and its promise, so it is refused instead.
+	 */
+	register(serverName, state, timeout = timeoutMs()) {
+		if (this.pending.has(serverName)) throw new Error(`an authorization for ${serverName} is already pending`);
+		let entry;
 		const promise = new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(serverName);
-				this.#release();
-				reject(new Error("authorization timed out — no browser callback within 10 minutes"));
-			}, CALLBACK_TIMEOUT_MS);
+				entry.respond?.(504, `<p><b>${escapeHtml(serverName)}</b>: authorization timed out. Close this tab and try again from DeepSeek Harness.</p>`);
+				this.releaseIfIdle();
+				reject(new Error(`authorization timed out — no browser callback within ${Math.round(timeout / 60000)} minutes`));
+			}, timeout);
 			timer.unref?.();
-			this.pending.set(serverName, { state, resolve, reject, timer });
+			entry = { state, resolve, reject, timer, respond: null };
+			this.pending.set(serverName, entry);
 		});
 		return { promise };
 	}
 
 	#handle(request, response) {
-		const reply = (status, text) => {
+		let done = false;
+		const reply = (status, text, release = false) => {
+			if (done) return;
+			done = true;
 			response.writeHead(status, {
 				"content-type": "text/html; charset=utf-8",
 				"cache-control": "no-store",
@@ -240,6 +287,7 @@ export class CallbackHub {
 				connection: "close"
 			});
 			response.end(`<!doctype html><meta charset="utf-8"><title>DeepSeek Harness</title><body style="font:15px -apple-system,system-ui;padding:2.5rem;line-height:1.5">${text}</body>`);
+			if (release) setTimeout(() => this.releaseIfIdle(), 0);
 		};
 
 		if (request.method !== "GET") {
@@ -251,42 +299,52 @@ export class CallbackHub {
 			reply(414, "Request too large.");
 			return;
 		}
-		const url = new URL(raw, `http://127.0.0.1:${this.port}`);
+		let url;
+		try {
+			url = new URL(raw, `http://127.0.0.1:${this.port}`);
+		} catch {
+			reply(400, "Malformed request.");
+			return;
+		}
 		const match = /^\/callback\/([^/]+)$/.exec(url.pathname);
 		if (!match) {
 			reply(404, "Not found.");
 			return;
 		}
-		const serverName = decodeURIComponent(match[1]);
+		let serverName;
+		try {
+			serverName = decodeURIComponent(match[1]);
+		} catch {
+			reply(400, "Malformed callback path.");
+			return;
+		}
 		const entry = this.pending.get(serverName);
 		if (!entry) {
-			reply(409, `<p><b>${serverName}</b>: no authorization is pending.</p><p>Start the connection again from DeepSeek Harness.</p>`);
+			reply(409, `<p><b>${escapeHtml(serverName)}</b>: no authorization is pending.</p><p>Start the connection again from DeepSeek Harness.</p>`);
 			return;
 		}
 		const error = url.searchParams.get("error");
 		const code = url.searchParams.get("code");
 		if (!equalState(entry.state, url.searchParams.get("state"))) {
-			reply(400, `<p><b>${serverName}</b>: state mismatch, request rejected.</p>`);
+			reply(400, `<p><b>${escapeHtml(serverName)}</b>: state mismatch, request rejected.</p>`);
 			return;
 		}
 		clearTimeout(entry.timer);
 		this.pending.delete(serverName);
 		if (error) {
 			const description = url.searchParams.get("error_description");
-			reply(200, `<p><b>${serverName}</b>: authorization was denied (${error}).</p>`);
-			this.#release();
+			reply(200, `<p><b>${escapeHtml(serverName)}</b>: authorization was denied (${escapeHtml(error)}).</p>`, true);
 			entry.reject(new Error(`authorization denied: ${error}${description ? ` — ${description}` : ""}`));
 			return;
 		}
 		if (!code) {
-			reply(400, `<p><b>${serverName}</b>: callback carried no code.</p>`);
-			this.#release();
+			reply(400, `<p><b>${escapeHtml(serverName)}</b>: callback carried no code.</p>`);
 			entry.reject(new Error("callback carried no authorization code"));
 			return;
 		}
-		reply(200, `<p><b>${serverName}</b>: authorized. You can close this tab.</p>`);
-		this.#release();
-		entry.resolve({ code, iss: url.searchParams.get("iss") ?? void 0 });
+		// The answer waits for the exchange: a failed exchange must not look like success.
+		entry.respond = (status, text) => reply(status, text, true);
+		entry.resolve({ code, iss: url.searchParams.get("iss") ?? void 0, respond: entry.respond });
 	}
 }
 
@@ -298,13 +356,9 @@ export function hubFor(port) {
 	return hub;
 }
 
-/**
- * Browser windows are a user-visible side effect: at most two automatic opens
- * per server in thirty minutes, so a closed tab or a failed exchange cannot
- * turn a reconnect loop into a storm of windows.
- */
 const RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 
+/** At most two windows per server per half hour, and none during a cooldown. */
 function allowBrowser(serverName) {
 	const now = Date.now();
 	const blockedUntil = registry.blocked.get(serverName) ?? 0;
@@ -312,11 +366,9 @@ function allowBrowser(serverName) {
 		log(`blocked:${serverName}`, `${serverName}: last authorization did not complete; not opening another browser window for ${Math.ceil((blockedUntil - now) / 60000)} more minutes — restart DeepSeek Harness to retry now`);
 		return false;
 	}
-	const windowMs = 30 * 60 * 1000;
-	const limit = 2;
-	const recent = (registry.attempts.get(serverName) ?? []).filter((at) => now - at < windowMs);
-	if (recent.length >= limit) {
-		log(`limit:${serverName}`, `${serverName}: authorization was already offered ${limit} times in the last 30 minutes; not opening another browser window — restart DeepSeek Harness when you are ready to authorize`);
+	const recent = (registry.attempts.get(serverName) ?? []).filter((at) => now - at < 30 * 60 * 1000);
+	if (recent.length >= 2) {
+		log(`limit:${serverName}`, `${serverName}: authorization was already offered twice in the last 30 minutes; not opening another browser window — restart DeepSeek Harness when you are ready to authorize`);
 		return false;
 	}
 	recent.push(now);
@@ -336,29 +388,47 @@ class KeychainOAuthProvider {
 		this.oauth = oauth;
 		this.hub = hub;
 		this.store = null;
+		this.dirty = new Set();
 	}
 
 	async load() {
 		if (this.store) return this.store;
 		const { keychain, file } = await readStores(this.serverName);
 		const merged = mergeStores(keychain, file);
-		this.store = merged ?? EMPTY_STATE();
-		if (merged?.tokens && keychain) {
-			let stored = null;
-			try {
-				stored = JSON.parse(keychain);
-			} catch {}
-			if (!stored?.tokens) {
-				await writeSecret(this.serverName, JSON.stringify(merged)).catch(() => {});
-				log(`repair:${this.serverName}`, `${this.serverName}: token from the file store merged into the Keychain entry`);
-			}
+		let state = merged ?? EMPTY_STATE();
+		// A credential issued for another resource is never reused.
+		if (state.resourceUrl && state.resourceUrl !== this.serverUrl) {
+			log(`resource:${this.serverName}`, `${this.serverName}: stored credential belongs to ${state.resourceUrl}, ignoring it for ${this.serverUrl}`);
+			state = EMPTY_STATE();
 		}
+		// A client registration bound to another redirect URI cannot be completed.
+		const client = state.clientInformation;
+		if (client?.redirect_uris && Array.isArray(client.redirect_uris) && !client.redirect_uris.includes(this.redirectUrl)) {
+			log(`client:${this.serverName}`, `${this.serverName}: stored client registration targets another redirect URI, registering again`);
+			state.clientInformation = null;
+			this.dirty.add("clientInformation");
+		}
+		this.store = state;
 		return this.store;
 	}
 
+	/**
+	 * Read-merge-write under a per-account queue: only the fields this provider
+	 * changed are applied, so a reconnect that holds a stale snapshot cannot
+	 * erase a token another provider just stored.
+	 */
 	async persist() {
-		const snapshot = JSON.stringify(this.store);
-		await queueWrite(this.serverName, () => writeSecret(this.serverName, snapshot));
+		const changed = [...this.dirty];
+		if (changed.length === 0) return;
+		const values = Object.fromEntries(changed.map((key) => [key, this.store[key]]));
+		this.dirty.clear();
+		await queueWrite(this.serverName, async () => {
+			const latest = mergeStores(...Object.values(await readStores(this.serverName))) ?? EMPTY_STATE();
+			for (const [key, value] of Object.entries(values)) latest[key] = value;
+			latest.resourceUrl = this.serverUrl;
+			await writeSecret(this.serverName, JSON.stringify(latest));
+			this.store = latest;
+		});
 	}
 
 	get redirectUrl() {
@@ -392,6 +462,7 @@ class KeychainOAuthProvider {
 	async saveClientInformation(info) {
 		await this.load();
 		this.store.clientInformation = info;
+		this.dirty.add("clientInformation");
 		await this.persist();
 	}
 
@@ -402,6 +473,7 @@ class KeychainOAuthProvider {
 	async saveTokens(tokens) {
 		await this.load();
 		this.store.tokens = tokens;
+		this.dirty.add("tokens");
 		await this.persist();
 		log(`token:${this.serverName}`, `${this.serverName}: access token stored (${tokens.token_type ?? "bearer"})`);
 	}
@@ -409,6 +481,7 @@ class KeychainOAuthProvider {
 	async saveCodeVerifier(codeVerifier) {
 		await this.load();
 		this.store.codeVerifier = codeVerifier;
+		this.dirty.add("codeVerifier");
 		await this.persist();
 	}
 
@@ -423,12 +496,14 @@ class KeychainOAuthProvider {
 	async saveDiscoveryState(discoveryState) {
 		await this.load();
 		this.store.discoveryState = discoveryState;
+		this.dirty.add("discoveryState");
 		await this.persist();
 	}
 
 	async saveAuthorizationServerUrl(url) {
 		await this.load();
 		this.store.authorizationServerUrl = url;
+		this.dirty.add("authorizationServerUrl");
 		await this.persist();
 	}
 
@@ -440,17 +515,20 @@ class KeychainOAuthProvider {
 			this.store.codeVerifier = null;
 			this.store.discoveryState = null;
 		}
-		await this.persist();
+		await queueWrite(this.serverName, () => clearSecret(this.serverName));
+		this.store = EMPTY_STATE();
+		this.dirty.clear();
+		log(`invalidate:${this.serverName}`, `${this.serverName}: credentials cleared from every store (${scope})`);
 	}
 
 	async state() {
-		this.pendingState = randomBytes(24).toString("base64url");
-		return this.pendingState;
+		return randomBytes(24).toString("base64url");
 	}
 
 	/**
-	 * The SDK awaits this call, so a busy port surfaces here — before the browser
-	 * opens — and a flow already under way is reused, never restarted.
+	 * The SDK awaits this call, so a busy port surfaces before the browser opens.
+	 * The state comes from the authorization URL itself, so a concurrent step-up
+	 * cannot leave the browser holding a value the listener never learned.
 	 */
 	async redirectToAuthorization(url) {
 		if (!/^https:$/.test(url.protocol) && url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
@@ -461,31 +539,47 @@ class KeychainOAuthProvider {
 			log(`pending:${this.serverName}`, `${this.serverName}: authorization is already open in the browser; finish it there`);
 			return;
 		}
-		this.hub.releaseIfIdle();
-		if (!allowBrowser(this.serverName)) return;
+		const state = url.searchParams.get("state") ?? randomBytes(24).toString("base64url");
+		registry.flows.set(this.serverName, true);
 		try {
+			this.hub.releaseIfIdle();
 			await this.hub.ensure();
 		} catch (error) {
+			registry.flows.delete(this.serverName);
 			log(`port:${this.hub.port}`, `${this.serverName}: ${String(error.message ?? error)}`);
 			return;
 		}
-
-		const state = this.pendingState ?? randomBytes(24).toString("base64url");
-		const { promise } = this.hub.register(this.serverName, state);
-		registry.flows.set(this.serverName, promise);
-		log(`authorize:${this.serverName}`, `${this.serverName}: authorize at ${url.href}`);
-		if (this.oauth.openBrowser !== false) {
-			spawn("open", [url.href], { stdio: "ignore", detached: true }).unref();
+		const manual = this.oauth.openBrowser === false;
+		if (!manual && !allowBrowser(this.serverName)) {
+			registry.flows.delete(this.serverName);
+			return;
 		}
-		promise
-			.then(async ({ code, iss }) => {
-				const auth = await loadAuth();
-				const outcome = await auth(this, {
-					serverUrl: this.serverUrl,
-					authorizationCode: code,
-					...(iss ? { iss } : {})
-				});
-				log(`result:${this.serverName}`, `${this.serverName}: authorization ${outcome}`);
+		let flow;
+		try {
+			flow = this.hub.register(this.serverName, state);
+		} catch (error) {
+			registry.flows.delete(this.serverName);
+			log(`pending:${this.serverName}`, `${this.serverName}: ${String(error.message ?? error)}`);
+			return;
+		}
+		log(`authorize:${this.serverName}`, `${this.serverName}: authorize at ${url.href}`);
+		if (!manual) spawn("open", [url.href], { stdio: "ignore", detached: true }).unref();
+		flow.promise
+			.then(async ({ code, iss, respond }) => {
+				try {
+					const auth = await loadAuth();
+					const outcome = await auth(this, {
+						serverUrl: this.serverUrl,
+						authorizationCode: code,
+						...(iss ? { iss } : {})
+					});
+					respond(200, `<p><b>${escapeHtml(this.serverName)}</b>: ${outcome === "AUTHORIZED" ? "authorized. You can close this tab." : `${escapeHtml(outcome)}. Check the DeepSeek Harness log.`}</p>`);
+					log(`result:${this.serverName}`, `${this.serverName}: authorization ${outcome}`);
+				} catch (error) {
+					respond(500, `<p><b>${escapeHtml(this.serverName)}</b>: the token exchange failed — see the DeepSeek Harness log.</p>`);
+					registry.blocked.set(this.serverName, Date.now() + RETRY_COOLDOWN_MS);
+					log(`failed:${this.serverName}`, `${this.serverName}: authorization failed: ${String(error.message ?? error)}; no automatic retry for 5 minutes`);
+				}
 			})
 			.catch((error) => {
 				registry.blocked.set(this.serverName, Date.now() + RETRY_COOLDOWN_MS);

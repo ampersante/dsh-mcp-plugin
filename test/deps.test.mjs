@@ -20,13 +20,18 @@ test("no lockfile is shipped", () => {
 	}
 });
 
-test("tests and runtime reach only builtins and the harness runtime", () => {
-	const source = readFileSync(join(root, "oauth.js"), "utf8");
-	const imports = [...source.matchAll(/from\s+"([^"]+)"/g)].map((match) => match[1]);
-	for (const specifier of imports) {
-		const local = specifier.startsWith("./");
-		const builtin = specifier.startsWith("node:");
-		const runtime = specifier === "@modelcontextprotocol/client";
-		assert.ok(local || builtin || runtime, `unexpected import: ${specifier}`);
+test("every module reaches only builtins and the harness runtime", async () => {
+	const { readdirSync } = await import("node:fs");
+	const files = [...readdirSync(root).filter((f) => f.endsWith(".js")), ...readdirSync(join(root, "test")).filter((f) => f.endsWith(".mjs")).map((f) => join("test", f))];
+	for (const file of files) {
+		const source = readFileSync(join(root, file), "utf8");
+		const specifiers = [
+			...[...source.matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1]),
+			...[...source.matchAll(/import\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1])
+		];
+		for (const specifier of specifiers) {
+			const allowed = specifier.startsWith(".") || specifier.startsWith("node:") || specifier.startsWith("@modelcontextprotocol/client") || specifier.startsWith("@deepseek-ai/");
+			assert.ok(allowed, `${file}: unexpected import ${specifier}`);
+		}
 	}
 });

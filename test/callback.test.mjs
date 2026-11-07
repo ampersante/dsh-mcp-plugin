@@ -11,12 +11,15 @@ async function startedHub(t) {
 
 const get = (port, path) => fetch(`http://127.0.0.1:${port}${path}`);
 
-test("a matching state resolves the flow with the code and issuer", async (t) => {
+test("a matching state delivers the code and issuer, and the reply follows the exchange", async (t) => {
 	const { hub, port } = await startedHub(t);
 	const flow = hub.register("alpha", "s1");
-	const response = await get(port, "/callback/alpha?code=c1&state=s1&iss=https%3A%2F%2Fas.example");
-	assert.equal(response.status, 200);
-	assert.deepEqual(await flow.promise, { code: "c1", iss: "https://as.example" });
+	const pending = get(port, "/callback/alpha?code=c1&state=s1&iss=https%3A%2F%2Fas.example");
+	const delivered = await flow.promise;
+	assert.equal(delivered.code, "c1");
+	assert.equal(delivered.iss, "https://as.example");
+	delivered.respond(200, "ok");
+	assert.equal((await pending).status, 200);
 });
 
 test("a wrong state answers 400 and leaves the flow pending", async (t) => {
@@ -50,8 +53,10 @@ test("a denial answers 200 and rejects the flow with the reason", async (t) => {
 test("the listener closes once the last flow finishes", async (t) => {
 	const { hub, port } = await startedHub(t);
 	const flow = hub.register("delta", "s3");
-	await get(port, "/callback/delta?code=c&state=s3");
-	await flow.promise;
+	const pending = get(port, "/callback/delta?code=c&state=s3");
+	const delivered = await flow.promise;
+	delivered.respond(200, "ok");
+	await pending;
 	await new Promise((r) => setTimeout(r, 20));
 	assert.equal(hub.server, null);
 	await assert.rejects(get(port, "/callback/delta?code=c&state=s3"));

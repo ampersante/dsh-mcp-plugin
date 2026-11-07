@@ -47,6 +47,9 @@ function createTransport(config) {
 		case "streamable-http": {
 			const requestInit = { headers: config.headers };
 			if (!config.oauth?.enabled) return new StreamableHTTPClientTransport(new URL(config.url), { requestInit });
+			const target = new URL(config.url);
+			const loopback = target.hostname === "127.0.0.1" || target.hostname === "localhost";
+			if (target.protocol !== "https:" && !loopback) throw new Error(`mcp-client(${config.serverName}): oauth requires an https URL — a bearer token must not travel over plain http`);
 			return new StreamableHTTPClientTransport(new URL(config.url), {
 				requestInit,
 				authProvider: createOAuthProvider({
@@ -447,7 +450,7 @@ const RECONNECT_DEFAULTS = Object.freeze({
 	enabled: true,
 	initialDelayMs: 500,
 	maxDelayMs: 2e3,
-	maxAttempts: 10
+	maxAttempts: 150
 });
 /** Default UTF-8 byte limit for attributed server instructions. */
 const DEFAULT_MAX_INSTRUCTION_BYTES = 32768;
