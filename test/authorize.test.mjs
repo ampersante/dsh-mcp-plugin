@@ -51,7 +51,8 @@ async function fakeAuthorizationServer({ rejectExchange = false } = {}) {
 			return;
 		}
 		if (url.pathname === "/.well-known/oauth-protected-resource") {
-			send(200, { resource: `${origin}/mcp`, authorization_servers: [origin] });
+			// Deliberately different from the endpoint path: the server names its audience.
+			send(200, { resource: origin, authorization_servers: [origin] });
 			return;
 		}
 		if (url.pathname === "/.well-known/oauth-authorization-server") {
@@ -138,6 +139,11 @@ test("completes the flow, stores a readable token and reuses it", async () => {
 		const link = await waitForLink(links);
 		assert.match(link, /code_challenge_method=S256/, "the link must carry PKCE");
 		assert.equal(new URL(link).searchParams.get("redirect_uri"), `http://127.0.0.1:${hubPort}/callback/local`);
+		assert.equal(
+			new URL(link).searchParams.get("resource"),
+			origin,
+			"the resource must be the audience the server advertises, not the endpoint URL",
+		);
 
 		// Act as the browser: consent, then follow the redirect to the callback.
 		const consent = await fetch(link, { redirect: "manual" });

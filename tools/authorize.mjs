@@ -69,9 +69,11 @@ export async function discover(serverUrl) {
 
 	const resource = await readJson(metadataUrl);
 	if (!resource.body) throw new Error(`protected resource metadata at ${metadataUrl} is unreadable`);
-	const issuer = resource.body.authorization_servers?.[0] ?? resource.body.resource ?? serverUrl;
+	// The server decides its own audience; an endpoint URL is not always it.
+	const resourceId = resource.body.resource ?? serverUrl;
+	const issuer = resource.body.authorization_servers?.[0] ?? resourceId;
 	const server = await authorizationServerMetadata(issuer);
-	return server;
+	return { ...server, resource: resourceId };
 }
 
 async function authorizationServerMetadata(issuer) {
@@ -161,7 +163,7 @@ export async function authorizeOne(name, serverUrl, { port, timeoutMs, force, lo
 	target.searchParams.set("state", state);
 	target.searchParams.set("code_challenge", challenge);
 	target.searchParams.set("code_challenge_method", "S256");
-	target.searchParams.set("resource", serverUrl);
+	target.searchParams.set("resource", server.resource);
 
 	const { promise } = provider.hub.register(name, state, timeoutMs);
 	await provider.hub.ensure();
@@ -175,7 +177,7 @@ export async function authorizeOne(name, serverUrl, { port, timeoutMs, force, lo
 			code,
 			verifier,
 			redirectUri: provider.redirectUrl,
-			resource: serverUrl,
+			resource: server.resource,
 		});
 		await provider.saveTokens({
 			access_token: tokens.access_token,
