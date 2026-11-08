@@ -44,6 +44,26 @@ rm -rf ~/.dsh/profiles/desktop/node_modules/dsh-mcp-oauth/.git
 The profile reloads on save. The first connection opens one browser window; approve it and the
 token lands in the Keychain. Later starts reuse it without any prompt.
 
+## Authorize from the terminal
+
+```sh
+node tools/authorize.mjs notion=https://mcp.notion.com/mcp
+node tools/authorize.mjs --port 8770 --parallel ticktick=https://… wispr=https://…
+```
+
+The listener runs in this terminal, so the redirect target is live before the link is printed and
+every failure is reported here instead of inside the application. The token goes to the same store
+the plugin reads, so the next connection reuses it without a browser. `--parallel` keeps several
+links valid at once.
+
+Open the link in a real browser window. A link opened inside the host application's own window
+arrives as a cross-site navigation and providers reject it, usually with a bare error page that
+names no cause.
+
+Pass the same number as `oauth.callbackPort` in the server config. The stored client registration
+names the redirect URI, so the two must agree or the plugin registers again and the refresh token
+belongs to a client it no longer uses.
+
 ## Update
 
 ```sh
@@ -60,11 +80,12 @@ documented path is `./tools/update.sh`, which uses the Node bundled with DeepSee
 ## Tests
 
 ```sh
-node --test "test/**/*.test.mjs"
+node --test --test-concurrency=1 "test/**/*.test.mjs"
 ```
 
 Covers credential-store merging, the callback listener (state, denial, unknown server, method,
-listener shutdown), client metadata, and the dependency-free guarantee.
+listener shutdown), client metadata, the terminal authorization flow against a local authorization
+server (PKCE challenge, exchange, stored token, reuse), and the dependency-free guarantee.
 
 ## Security notes
 
@@ -79,10 +100,11 @@ listener shutdown), client metadata, and the dependency-free guarantee.
 
 - The plugin is a fork of `dsh-mcp-client`; a DeepSeek Harness update may require re-applying the
   transport patch.
-- The code exchange test takes the MCP SDK from the installed DeepSeek Harness (`app.asar`). With no
-  harness installed it is skipped with a reason; if the bundle layout changes, it fails with a message
-  naming the bundle, and an install is rejected until `test/support/sdk.mjs` is updated for that
-  harness version.
+- The exchange test needs a copy of `@modelcontextprotocol/client`, taken from `DSH_MCP_OAUTH_SDK`
+  or `~/.dsh/mcp-oauth-sdk`. It never reads the application bundle; without a copy it is skipped
+  with a reason, and a copy that exists but is incomplete fails instead of silently skipping.
+- An authorization endpoint that answers with JSON rather than a redirect (alphaXiv does) shows a
+  JSON body in the browser; open the `url` field of that answer instead.
 
 ## License
 

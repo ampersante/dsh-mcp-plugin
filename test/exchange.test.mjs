@@ -8,7 +8,7 @@ import test, { after } from "node:test";
 
 import { startMock } from "./support/mock-oauth.mjs";
 import { installSecurityStub } from "./support/security.mjs";
-import { ASAR, installResolveHook, resolveSdk } from "./support/sdk.mjs";
+import { SDK_ROOT, installResolveHook, resolveSdk } from "./support/sdk.mjs";
 
 function freePort() {
 	return new Promise((resolve, reject) => {
@@ -53,8 +53,8 @@ let auth;
 const sdk = await resolveSdk();
 
 if (sdk === null) {
-	test(`OAuth code exchange against the bundled MCP SDK (skip: ${ASAR} is not installed)`, {
-		skip: `the DeepSeek Harness bundle is not installed at ${ASAR}`
+	test(`OAuth code exchange against a provided MCP SDK (skip: ${SDK_ROOT} is not installed)`, {
+		skip: `no MCP SDK copy at ${SDK_ROOT}; set DSH_MCP_OAUTH_SDK or place the package there`
 	}, () => {});
 } else {
 	// Both must be in place before oauth.js is imported: the module reads them

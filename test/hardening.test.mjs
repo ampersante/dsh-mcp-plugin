@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), "dsh-mcp-oauth-test-"));
 const { CallbackHub, createOAuthProvider } = await import("../oauth.js");
+const { installSecurityStub } = await import("./support/security.mjs");
 
 async function hubOn(t) {
 	const hub = new CallbackHub(0);
@@ -47,7 +48,8 @@ test("callback markup escapes a hostile server name", async (t) => {
 	assert.match(body, /&lt;img/);
 });
 
-test("revoking credentials deletes the file copy as well", async () => {
+test("revoking credentials deletes the file copy as well", async (t) => {
+	installSecurityStub(t, { hard: true });
 	const provider = createOAuthProvider({ serverName: "revoke-me", serverUrl: "https://mcp.example/mcp", oauth: { enabled: true, callbackPort: 8799 } });
 	await provider.saveTokens({ access_token: "secret", token_type: "Bearer" });
 	assert.ok(await provider.tokens());
@@ -55,7 +57,8 @@ test("revoking credentials deletes the file copy as well", async () => {
 	assert.equal(await provider.tokens(), undefined);
 });
 
-test("credentials issued for another resource are not reused", async () => {
+test("credentials issued for another resource are not reused", async (t) => {
+	installSecurityStub(t, { hard: true });
 	const a = createOAuthProvider({ serverName: "shared-name", serverUrl: "https://one.example/mcp", oauth: { enabled: true, callbackPort: 8798 } });
 	await a.saveTokens({ access_token: "token-one", token_type: "Bearer" });
 	const b = createOAuthProvider({ serverName: "shared-name", serverUrl: "https://two.example/mcp", oauth: { enabled: true, callbackPort: 8798 } });

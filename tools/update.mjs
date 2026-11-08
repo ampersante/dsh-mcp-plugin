@@ -89,7 +89,7 @@ try {
 	if (!existsSync(join(staged, "package.json"))) throw new Error(`ref ${ref} does not contain package.json`);
 
 	console.log(`testing ${ref} with ${node}`);
-	execFileSync(node, ["--test", "test/**/*.test.mjs"], { cwd: staged, stdio: "inherit", timeout: 180000 });
+	execFileSync(node, ["--test", "--test-concurrency=1", "test/**/*.test.mjs"], { cwd: staged, stdio: "inherit", timeout: 180000 });
 
 	if (existsSync(target)) renameSync(target, backup);
 	swapped = true;
