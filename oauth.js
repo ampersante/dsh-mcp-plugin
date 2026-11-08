@@ -30,6 +30,9 @@ const DEFAULT_CALLBACK_PORT = 8765;
 const MAX_QUERY_BYTES = 8192;
 const LOG_DEDUPE_MS = 10 * 60 * 1000;
 const SECURITY_TIMEOUT_MS = 15000;
+// `security -i` reads stdin line by line and silently cuts a line past 4096
+// bytes while still exiting 0, so a longer command goes straight to the file.
+const KEYCHAIN_COMMAND_LIMIT = 4000;
 const STATE_PATH = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "mcp-oauth");
 
 function timeoutMs() {
@@ -102,13 +105,18 @@ function run(command, args, input) {
 	});
 }
 
-async function readStores(account) {
-	let keychain = null;
+async function readKeychainItem(account) {
 	try {
 		const stdout = await run("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]);
 		const encoded = stdout.trim();
-		if (encoded) keychain = Buffer.from(encoded, "base64").toString("utf8");
-	} catch {}
+		return encoded ? Buffer.from(encoded, "base64").toString("utf8") : null;
+	} catch {
+		return null;
+	}
+}
+
+async function readStores(account) {
+	const keychain = await readKeychainItem(account);
 	let file = null;
 	try {
 		file = await readFile(join(STATE_PATH, `${account}.json`), "utf8");
@@ -143,32 +151,58 @@ export function mergeStores(keychain, file) {
 	return merged;
 }
 
+/** Remove the Keychain entry only; the file store is a separate copy. */
+async function deleteKeychainItem(account) {
+	await run("security", ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account]).catch(() => {});
+}
+
+/** Replace the file copy atomically, readable by its owner only. */
+async function writeFileStore(account, value) {
+	await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
+	const target = join(STATE_PATH, `${account}.json`);
+	const temporary = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	try {
+		await writeFile(temporary, value, { mode: 0o600 });
+		await chmod(temporary, 0o600);
+		await rename(temporary, target);
+	} finally {
+		await rm(temporary, { force: true }).catch(() => {});
+	}
+	return target;
+}
+
 async function writeSecret(account, value) {
 	const encoded = Buffer.from(value, "utf8").toString("base64");
+	const command = `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${account} -w ${encoded}`;
+	if (Buffer.byteLength(command, "utf8") >= KEYCHAIN_COMMAND_LIMIT) {
+		const target = await writeFileStore(account, value);
+		// A stale Keychain copy would win over the file on the next read.
+		await deleteKeychainItem(account);
+		log(`store:${account}`, `${account}: credential does not fit one security command line; kept at ${target} with mode 0600`);
+		return "file";
+	}
 	try {
-		await run("security", ["-i"], `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${account} -w ${encoded}\n`);
-		return "keychain";
+		await run("security", ["-i"], `${command}\n`);
 	} catch (error) {
-		await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
-		const target = join(STATE_PATH, `${account}.json`);
-		const temporary = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-		try {
-			await writeFile(temporary, value, { mode: 0o600 });
-			await chmod(temporary, 0o600);
-			await rename(temporary, target);
-		} finally {
-			await rm(temporary, { force: true }).catch(() => {});
-		}
+		const target = await writeFileStore(account, value);
 		log(`store:${account}`, `${account}: Keychain unavailable (${String(error).split("\n")[0]}); credentials kept at ${target} with mode 0600`);
 		return "file";
 	}
+	const stored = await readKeychainItem(account);
+	if (stored !== value) {
+		await deleteKeychainItem(account);
+		const target = await writeFileStore(account, value);
+		log(`store:${account}`, `${account}: Keychain returned a different value after the write; removed that entry and kept credentials at ${target} with mode 0600`);
+		return "file";
+	}
+	return "keychain";
 }
 
 /** Revocation must remove every copy: a surviving file would resurrect the secret. */
 async function clearSecret(account) {
 	const path = join(STATE_PATH, `${account}.json`);
 	await rm(path, { force: true }).catch(() => {});
-	await run("security", ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account]).catch(() => {});
+	await deleteKeychainItem(account);
 }
 
 /** Serialize writes per account so two concurrent saves cannot interleave. */
@@ -194,6 +228,21 @@ function escapeHtml(value) {
 		'"': "&quot;",
 		"'": "&#39;"
 	})[character]);
+}
+
+/**
+ * Manual mode leaves the one-shot authorization link in the state directory so
+ * a person can open it in the browser where the service is already signed in.
+ */
+async function writeAuthorizeLink(account, href) {
+	try {
+		await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
+		const path = join(STATE_PATH, `${account}.authorize.txt`);
+		await writeFile(path, `${href}\n`, { mode: 0o600 });
+		await chmod(path, 0o600);
+	} catch (error) {
+		log(`manual:${account}`, `${account}: could not write the authorization link (${String(error.message ?? error)})`);
+	}
 }
 
 /** The callback listener. It serves while any flow is pending, then closes. */
@@ -563,6 +612,7 @@ class KeychainOAuthProvider {
 			return;
 		}
 		log(`authorize:${this.serverName}`, `${this.serverName}: authorize at ${url.href}`);
+		if (manual) await writeAuthorizeLink(this.serverName, url.href);
 		if (!manual) spawn("open", [url.href], { stdio: "ignore", detached: true }).unref();
 		flow.promise
 			.then(async ({ code, iss, respond }) => {
@@ -585,6 +635,9 @@ class KeychainOAuthProvider {
 				registry.blocked.set(this.serverName, Date.now() + RETRY_COOLDOWN_MS);
 				log(`failed:${this.serverName}`, `${this.serverName}: authorization failed: ${String(error.message ?? error)}; no automatic retry for 5 minutes`);
 			})
-			.finally(() => registry.flows.delete(this.serverName));
+			.finally(() => {
+				registry.flows.delete(this.serverName);
+				void rm(join(STATE_PATH, `${this.serverName}.authorize.txt`), { force: true }).catch(() => {});
+			});
 	}
 }

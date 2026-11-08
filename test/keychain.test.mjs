@@ -37,6 +37,22 @@ test("tokens round-trip through the Keychain and leave no file copy", { timeout:
 	assert.equal(existsSync(storedFile(serverName)), false, "the file store must stay unused while the Keychain works");
 });
 
+test("an oversized credential replaces the Keychain entry and is read whole from the file", { timeout: 20000 }, async (t) => {
+	const stub = installSecurityStub(t, { hard: true });
+	const serverName = "keychain-oversized";
+	await provider(serverName).saveTokens({ access_token: "previous-token", token_type: "Bearer" });
+	assert.deepEqual(Object.keys(stub.readStore()), [`${KEYCHAIN_SERVICE}/${serverName}`], "the small credential must start in the Keychain");
+
+	const tokens = { access_token: "large-token", token_type: "Bearer", blob: "x".repeat(5000) };
+	await provider(serverName).saveTokens(tokens);
+
+	assert.deepEqual(stub.readStore(), {}, "the oversized value and its stale Keychain copy must not remain");
+	const path = storedFile(serverName);
+	assert.ok(existsSync(path), "the oversized credential must land in the file store");
+	assert.equal(statSync(path).mode & 0o777, 0o600);
+	assert.deepEqual(await provider(serverName).tokens(), tokens, "a fresh provider must read the new credential back whole");
+});
+
 test("a failing Keychain falls back to a 0600 file", { timeout: 20000 }, async (t) => {
 	const stub = installSecurityStub(t, { fail: true, hard: true });
 	const serverName = "keychain-fallback";

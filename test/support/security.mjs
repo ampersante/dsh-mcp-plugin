@@ -70,11 +70,16 @@ if (command === "find-generic-password") {
 } else if (command === "-i") {
 	let input = "";
 	for await (const chunk of process.stdin) input += chunk;
-	const words = input.trim().split(/\s+/);
-	if (words[0] !== "add-generic-password") refuse("unsupported stdin command: " + words[0]);
-	const key = valueOf(words, "-s") + "/" + valueOf(words, "-a");
 	const store = readStore();
-	store[key] = valueOf(words, "-w");
+	// The real security -i reads stdin line by line and silently truncates a
+	// line past 4096 characters, still exiting 0. Reproduce that before parsing.
+	for (const line of input.split("\n")) {
+		if (!line.trim()) continue;
+		const words = line.slice(0, 4096).trim().split(/\s+/);
+		if (words[0] !== "add-generic-password") refuse("unsupported stdin command: " + words[0]);
+		const key = valueOf(words, "-s") + "/" + valueOf(words, "-a");
+		store[key] = valueOf(words, "-w");
+	}
 	writeStore(store);
 } else {
 	refuse("unsupported invocation: " + args.join(" "));
