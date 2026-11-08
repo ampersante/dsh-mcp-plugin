@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { compare } from "./version.mjs";
 
 const DESKTOP = join(process.env.HOME ?? "", ".dsh", "profiles", "desktop");
 
@@ -55,24 +56,6 @@ function tags() {
 		.sort((a, b) => compare(a.replace(/^v/, ""), b.replace(/^v/, "")));
 }
 
-function compare(a, b) {
-	const parse = (value) => value.split("-")[0].split(".").map((part) => {
-		const n = Number(part);
-		return Number.isFinite(n) ? n : 0;
-	});
-	const pa = parse(a);
-	const pb = parse(b);
-	for (let i = 0; i < 3; i += 1) {
-		const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-		if (d !== 0) return d;
-	}
-	// A prerelease sorts below its release.
-	const preA = a.includes("-");
-	const preB = b.includes("-");
-	if (preA !== preB) return preA ? -1 : 1;
-	return 0;
-}
-
 function installedVersion() {
 	try {
 		return JSON.parse(readFileSync(join(target, "package.json"), "utf8")).version;
@@ -100,13 +83,13 @@ const backup = `${target}.backup-${Date.now()}`;
 let swapped = false;
 
 try {
-	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, "index.js", "oauth.js", "package.json", "test"], { maxBuffer: 64 * 1024 * 1024 });
+	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, "index.js", "oauth.js", "package.json", "test", "tools/version.mjs"], { maxBuffer: 64 * 1024 * 1024 });
 	execFileSync("tar", ["-x", "-C", staging], { input: archive });
 	const staged = staging;
 	if (!existsSync(join(staged, "package.json"))) throw new Error(`ref ${ref} does not contain package.json`);
 
 	console.log(`testing ${ref} with ${node}`);
-	execFileSync(node, ["--test"], { cwd: staged, stdio: "inherit" });
+	execFileSync(node, ["--test", "test/**/*.test.mjs"], { cwd: staged, stdio: "inherit", timeout: 180000 });
 
 	if (existsSync(target)) renameSync(target, backup);
 	swapped = true;

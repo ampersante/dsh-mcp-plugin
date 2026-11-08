@@ -54,11 +54,13 @@ token lands in the Keychain. Later starts reuse it without any prompt.
 
 The updater exports the tag, runs the test suite, backs up the installed copy, swaps it in, and
 restores the backup on any failure. It needs `git` and Node; it does not need npm or pnpm.
+Running `node tools/update.mjs` directly requires Node 22.15+ (the tests need `registerHooks`); the
+documented path is `./tools/update.sh`, which uses the Node bundled with DeepSeek Harness.
 
 ## Tests
 
 ```sh
-node --test
+node --test "test/**/*.test.mjs"
 ```
 
 Covers credential-store merging, the callback listener (state, denial, unknown server, method,
@@ -77,7 +79,10 @@ listener shutdown), client metadata, and the dependency-free guarantee.
 
 - The plugin is a fork of `dsh-mcp-client`; a DeepSeek Harness update may require re-applying the
   transport patch.
-- The code exchange is verified against ClickUp; it has no automated integration test yet.
+- The code exchange test takes the MCP SDK from the installed DeepSeek Harness (`app.asar`). With no
+  harness installed it is skipped with a reason; if the bundle layout changes, it fails with a message
+  naming the bundle, and an install is rejected until `test/support/sdk.mjs` is updated for that
+  harness version.
 
 ## License
 
