@@ -116,6 +116,12 @@ if (command === "find-generic-password") {
 	}
 	delete store[key];
 	writeStore(store);
+	if (marker("deleteconfirmcode")) {
+		// The real tool can confirm the deletion on stdout and still exit
+		// non-zero; the store is already updated above.
+		process.stdout.write("password has been deleted.\n");
+		process.exit(161);
+	}
 } else if (command === "-i") {
 	if (marker("failwrites")) refuse("forced write failure", 36);
 	if (marker("holdwrites")) {

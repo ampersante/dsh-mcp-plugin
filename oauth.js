@@ -121,6 +121,7 @@ function run(command, args, input) {
 			const error = new Error(`${command} exited ${code}: ${stderr.trim()}`);
 			error.exitCode = code;
 			error.stderr = stderr;
+			error.stdout = stdout;
 			finish(reject, error);
 		});
 		child.stdin.on("error", () => {});
@@ -164,6 +165,9 @@ export async function removeKeychainEntry(account) {
 	} catch (error) {
 		if (error.code === "ENOENT") return "unavailable";
 		if (error.exitCode === 44) return "gone";
+		// macOS security(1) can report the deletion on stdout and still exit
+		// non-zero. A confirmed deletion is a removal, whatever the code says.
+		if (/password has been deleted/i.test(`${error.stdout ?? ""}${error.stderr ?? ""}`)) return "gone";
 		throw keychainFailure("delete-generic-password", error);
 	}
 }

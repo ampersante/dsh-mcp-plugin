@@ -462,6 +462,22 @@ test("K20d: a successful add whose helper vanishes before verification aborts wi
 	assert.deepEqual(keychainState(stub, serverName).tokens, tokens, "the Keychain must still hold the value the add stored");
 });
 
+// K20f: security(1) confirms the deletion on stdout but exits non-zero
+// (observed on macOS, code 161). A confirmed deletion is a removal: the save
+// must proceed instead of reporting an unknown state.
+test("K20f: a deletion confirmed on stdout counts as gone despite a non-zero exit", { timeout: 20000 }, async (t) => {
+	const stub = installSecurityStub(t, { hard: true, markers: ["deleteconfirmcode"] });
+	const serverName = "k20f-delete-confirmed";
+	const tokens = token("fresh-token");
+
+	await provider(serverName).saveTokens(tokens);
+
+	const fresh = provider(serverName);
+	assert.deepEqual(await fresh.tokens(), tokens, "the credential must be readable after a confirmed deletion");
+	assert.equal(existsSync(storedFile(serverName)), false, "the Keychain copy must be the only one");
+	assert.equal(await oauth.removeKeychainEntry(serverName), "gone", "the exported helper must report the confirmed removal");
+});
+
 // K20e: verification reads a mismatched value, then the helper disappears
 // before cleanup. An unconfirmed removal is an unknown state, not permission
 // to write a file next to the record that may still be there.
