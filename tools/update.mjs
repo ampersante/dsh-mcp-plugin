@@ -102,10 +102,12 @@ try {
 	const paths = ["index.js", "oauth.js", "package.json", "test", "tools/version.mjs"];
 	// Tags from before the terminal authorizer do not carry this file, and
 	// `git archive` fails the whole export on a missing path.
-	try {
-		git("cat-file", "-e", `${ref}:tools/authorize.mjs`);
-		paths.push("tools/authorize.mjs");
-	} catch {}
+	for (const optional of ["tools/authorize.mjs", "tools/update.mjs"]) {
+		try {
+			git("cat-file", "-e", `${ref}:${optional}`);
+			paths.push(optional);
+		} catch {}
+	}
 	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, ...paths], { maxBuffer: 64 * 1024 * 1024 });
 	execFileSync("tar", ["-x", "-C", staging], { input: archive });
 	const staged = staging;
