@@ -12,6 +12,8 @@
  * token and never opens a browser.
  */
 import { createHash, randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { createOAuthProvider } from "../oauth.js";
 
 const INITIALIZE = {
@@ -31,6 +33,11 @@ function base64url(buffer) {
 
 function escapeHtml(value) {
 	return String(value).replace(/[&<>"']/g, (character) => `&#${character.charCodeAt(0)};`);
+}
+
+/** Server text reaches the terminal, so drop C0 controls (except tab and newline) and C1. */
+export function sanitizeForTerminal(text) {
+	return String(text).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 }
 
 async function readJson(url, init) {
@@ -103,7 +110,7 @@ async function registerClient(provider, server) {
 		body: JSON.stringify(provider.clientMetadata),
 	});
 	if (!response.ok || !body?.client_id) {
-		throw new Error(`client registration was refused (${response.status}): ${text.slice(0, 200)}`);
+		throw new Error(`client registration was refused (${response.status}): ${sanitizeForTerminal(text).slice(0, 200)}`);
 	}
 	return body;
 }
@@ -131,7 +138,7 @@ async function exchange({ server, client, code, verifier, redirectUri, resource 
 	});
 	if (!response.ok || !body?.access_token) {
 		const detail = body?.error ? `${body.error}${body.error_description ? ` — ${body.error_description}` : ""}` : text;
-		throw new Error(`token exchange failed (${response.status}): ${String(detail).slice(0, 200)}`);
+		throw new Error(`token exchange failed (${response.status}): ${sanitizeForTerminal(detail).slice(0, 200)}`);
 	}
 	return body;
 }
@@ -165,8 +172,8 @@ export async function authorizeOne(name, serverUrl, { port, timeoutMs, force, lo
 	target.searchParams.set("code_challenge_method", "S256");
 	target.searchParams.set("resource", server.resource);
 
-	const { promise } = provider.hub.register(name, state, timeoutMs);
 	await provider.hub.ensure();
+	const { promise } = provider.hub.register(name, state, timeoutMs);
 	log(target.href);
 
 	const { code, respond } = await promise;
@@ -272,4 +279,14 @@ async function main() {
 	process.exit(failures === 0 ? 0 : 1);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) await main();
+/** Run the CLI only when it was started directly, including through a symlink. */
+function isMainModule() {
+	if (!process.argv[1]) return false;
+	try {
+		return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) await main();

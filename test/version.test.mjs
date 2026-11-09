@@ -18,7 +18,10 @@ test("0.9.9 sorts below 1.0.0", () => {
 	assert.ok(compare("0.9.9", "1.0.0") < 0, "0.9.9 must sort below 1.0.0");
 });
 
-test("prerelease labels of one version compare equal", () => {
-	// compare() does not order prerelease labels; this test locks that current behaviour.
-	assert.equal(compare("1.2.3-alpha", "1.2.3-beta"), 0);
+test("V1: prerelease identifiers follow SemVer precedence", () => {
+	// SemVer 2.0.0 §11: numeric identifiers compare numerically, a shorter set
+	// sorts below its longer prefix, and numeric sorts below alphanumeric.
+	assert.ok(compare("1.0.0-rc.2", "1.0.0-rc.10") < 0, "rc.2 must sort below rc.10");
+	assert.ok(compare("1.0.0-alpha", "1.0.0-alpha.1") < 0, "alpha must sort below alpha.1");
+	assert.ok(compare("1.0.0-1", "1.0.0-alpha") < 0, "a numeric identifier must sort below a label");
 });

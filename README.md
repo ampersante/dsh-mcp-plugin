@@ -13,7 +13,8 @@ copy of `@deepseek-ai/dsh-mcp-client` with that one gap closed.
 - the MCP SDK bundled inside DeepSeek Harness (`@modelcontextprotocol/client`) — a runtime peer,
   not a dependency;
 - Node builtins;
-- the macOS Keychain through `security(1)`, with a `0600` file fallback.
+- the macOS Keychain through `security(1)`; a `0600` file is used only when the Keychain holds
+  no entry or `security(1)` is unavailable, and any other Keychain error aborts the save.
 
 `package.json` declares no dependencies of any kind, and a test fails the build if one appears.
 
@@ -95,6 +96,12 @@ server (PKCE challenge, exchange, stored token, reuse), and the dependency-free 
 - The port is reserved before the browser opens, so a busy port fails fast instead of after consent.
 - At most two browser windows per server per 30 minutes, then a five-minute cooldown after a failure.
 - Tokens never enter logs or the model context; the Keychain is the primary store.
+- A successful save leaves exactly one live copy of the secret; revoking credentials fails if a
+  copy cannot be removed.
+- Any Keychain error other than a missing entry (code 44) or an absent `security(1)` aborts the
+  save; in those two cases only, the secret goes to the `0600` file.
+- The terminal authorizer checks the account name against the same `[A-Za-z0-9_-]{1,32}` pattern
+  as the server config.
 
 ## Limitations
 
@@ -102,7 +109,8 @@ server (PKCE challenge, exchange, stored token, reuse), and the dependency-free 
   transport patch.
 - The exchange test needs a copy of `@modelcontextprotocol/client`, taken from `DSH_MCP_OAUTH_SDK`
   or `~/.dsh/mcp-oauth-sdk`. It never reads the application bundle; without a copy it is skipped
-  with a reason, and a copy that exists but is incomplete fails instead of silently skipping.
+  with a reason (CI has no copy), and a copy that exists but is incomplete fails instead of
+  silently skipping.
 - An authorization endpoint that answers with JSON rather than a redirect (alphaXiv does) shows a
   JSON body in the browser; open the `url` field of that answer instead.
 

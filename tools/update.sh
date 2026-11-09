@@ -4,7 +4,8 @@
 set -eu
 
 BUNDLED="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node"
-REPO="${DSH_MCP_OAUTH_REPO:-/Users/eli/Work/harness/ai-engineering/scratch/mcp-oauth}"
+SCRIPT="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+REPO="${DSH_MCP_OAUTH_REPO:-$(cd "$(dirname "$SCRIPT")/.." && pwd)}"
 
 if [ -x "$BUNDLED" ]; then
 	NODE="$BUNDLED"

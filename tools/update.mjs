@@ -70,6 +70,22 @@ if (available.length === 0) {
 	process.exit(2);
 }
 const ref = arg("--ref", available.at(-1));
+if (ref === undefined || ref === "") {
+	console.error("--ref needs a value: pass an existing v* tag, for example --ref v0.6.0");
+	process.exit(2);
+}
+if (ref.startsWith("-")) {
+	console.error(`--ref needs a tag name, not an option: ${ref}`);
+	process.exit(2);
+}
+try {
+	// Exact tag name only: `rev-parse --verify` would also accept expressions
+	// such as `v0.8.2^{tree}` or `v0.8.2~0`, which export another object.
+	git("show-ref", "--verify", "--quiet", `refs/tags/${ref}`);
+} catch {
+	console.error(`ref must be an existing v* tag: ${ref}`);
+	process.exit(2);
+}
 const version = ref.replace(/^v/, "");
 const current = installedVersion();
 
@@ -83,7 +99,14 @@ const backup = `${target}.backup-${Date.now()}`;
 let swapped = false;
 
 try {
-	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, "index.js", "oauth.js", "package.json", "test", "tools/version.mjs"], { maxBuffer: 64 * 1024 * 1024 });
+	const paths = ["index.js", "oauth.js", "package.json", "test", "tools/version.mjs"];
+	// Tags from before the terminal authorizer do not carry this file, and
+	// `git archive` fails the whole export on a missing path.
+	try {
+		git("cat-file", "-e", `${ref}:tools/authorize.mjs`);
+		paths.push("tools/authorize.mjs");
+	} catch {}
+	const archive = execFileSync("git", ["-C", repo, "archive", "--format=tar", ref, ...paths], { maxBuffer: 64 * 1024 * 1024 });
 	execFileSync("tar", ["-x", "-C", staging], { input: archive });
 	const staged = staging;
 	if (!existsSync(join(staged, "package.json"))) throw new Error(`ref ${ref} does not contain package.json`);

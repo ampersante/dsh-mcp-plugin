@@ -3,17 +3,22 @@
  * It drives the flow the way a browser would, without leaving this process.
  */
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { symlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
+import { installSecurityStub } from "./support/security.mjs";
 
 const home = await mkdtemp(join(tmpdir(), "dsh-authorize-"));
 process.env.DSH_HOME = home;
-const { authorizeOne } = await import("../tools/authorize.mjs");
-const { createOAuthProvider } = await import("../oauth.js");
+const authorizeModule = await import("../tools/authorize.mjs");
+const { authorizeOne } = authorizeModule;
+const { createOAuthProvider, hubFor } = await import("../oauth.js");
 
 after(() => rm(home, { recursive: true, force: true }));
 
@@ -125,7 +130,9 @@ function waitForLink(links) {
 	});
 }
 
-test("completes the flow, stores a readable token and reuses it", async () => {
+test("completes the flow, stores a readable token and reuses it", async (t) => {
+	// Every authorization test runs against the stub, never the real Keychain.
+	const stub = installSecurityStub(t, { hard: true });
 	const { server, origin, state } = await fakeAuthorizationServer();
 	const hubPort = await freePort();
 	const links = [];
@@ -163,6 +170,12 @@ test("completes the flow, stores a readable token and reuses it", async () => {
 		assert.equal(stored.access_token, "local-access-token");
 		assert.equal(stored.refresh_token, "local-refresh-token");
 
+		// A4 guard: the flow must persist through the hard security stub.
+		assert.ok(
+			Object.keys(stub.readStore()).includes("dsh-mcp-oauth/local"),
+			"the authorization must be written through the security stub, never the real Keychain",
+		);
+
 		const again = await authorizeOne("local", `${origin}/mcp`, {
 			port: hubPort,
 			timeoutMs: 5000,
@@ -176,7 +189,8 @@ test("completes the flow, stores a readable token and reuses it", async () => {
 	}
 });
 
-test("reports a rejected exchange and keeps no token", async () => {
+test("reports a rejected exchange and keeps no token", async (t) => {
+	installSecurityStub(t, { hard: true });
 	const world = await fakeAuthorizationServer({ rejectExchange: true });
 	const hubPort = await freePort();
 	const links = [];
@@ -209,4 +223,70 @@ test("reports a rejected exchange and keeps no token", async () => {
 	} finally {
 		await new Promise((resolve) => world.server.close(resolve));
 	}
+});
+
+// ── A1–A3: busy port, symlinked CLI, terminal text ──────────────────────────
+
+// A1: a busy callback port must be an error with a code, and no flow may be left pending.
+test("A1: a busy callback port fails with EADDRINUSE and leaves nothing pending", { timeout: 20000 }, async (t) => {
+	installSecurityStub(t, { hard: true });
+	const world = await fakeAuthorizationServer();
+	t.after(() => new Promise((resolve) => world.server.close(resolve)));
+	const busy = createServer();
+	const busyPort = await listen(busy);
+	t.after(() => new Promise((resolve) => busy.close(resolve)));
+
+	let failure;
+	try {
+		await authorizeOne("busy", `${world.origin}/mcp`, {
+			port: busyPort,
+			timeoutMs: 50,
+			force: false,
+			log: () => assert.fail("a busy port must not print a link"),
+		});
+	} catch (error) {
+		failure = error;
+	}
+	// Record the result before teardown: a broken version leaves a flow behind.
+	const hub = hubFor(busyPort);
+	const pendingAfterFailure = hub.pending.size;
+	for (const entry of hub.pending.values()) clearTimeout(entry.timer);
+	hub.pending.clear();
+
+	assert.ok(failure, "authorizeOne must reject a busy port");
+	assert.equal(failure.code, "EADDRINUSE", "the error must carry the bind error code");
+	assert.match(failure.message, /busy/, "the message must say the port is busy");
+	assert.equal(pendingAfterFailure, 0, "a failed bind must leave no pending flow");
+});
+
+// A2: the CLI must start when reached through a symlink, not only by its real path.
+test("A2: --help works through a symlink and exits 2", { timeout: 20000 }, async (t) => {
+	installSecurityStub(t, { hard: true });
+	const dir = await mkdtemp(join(tmpdir(), "dsh-authorize-link-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const link = join(dir, "authorize-link.mjs");
+	symlinkSync(fileURLToPath(new URL("../tools/authorize.mjs", import.meta.url)), link);
+
+	const result = spawnSync(process.execPath, [link, "--help"], {
+		encoding: "utf8",
+		timeout: 15000,
+		env: { ...process.env, DSH_HOME: home },
+	});
+	assert.equal(result.status, 2, `--help through a symlink must exit 2 (status=${result.status}): ${result.stderr}`);
+	assert.match(result.stderr, /Usage:/, "the usage text must reach stderr");
+});
+
+// A3: server-provided text reaches the terminal, so control sequences are removed.
+test("A3: sanitizeForTerminal drops escape controls and keeps newlines", { timeout: 20000 }, async (t) => {
+	installSecurityStub(t, { hard: true });
+	const sanitize = authorizeModule.sanitizeForTerminal;
+	assert.equal(typeof sanitize, "function", "sanitizeForTerminal must be exported");
+
+	const hostile = "safe\x1b[31mred\x1b[0m\x1b]8;;https://x\x07link\x1b]8;;\x07\x9b31mC1\nnext\ttab";
+	const cleaned = sanitize(hostile);
+	assert.ok(!cleaned.includes("\x1b"), "ESC must be removed");
+	assert.ok(!/[\x00-\x08\x0e-\x1f\x7f-\x9f]/.test(cleaned), `every C0/C1 control must be removed, got ${JSON.stringify(cleaned)}`);
+	assert.ok(cleaned.includes("\n"), "newlines must survive");
+	assert.ok(cleaned.includes("\t"), "tabs must survive");
+	assert.ok(cleaned.includes("safe") && cleaned.includes("next"), "printable text must survive");
 });

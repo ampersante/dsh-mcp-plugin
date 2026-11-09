@@ -21,7 +21,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile, chmod } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -30,9 +30,12 @@ const DEFAULT_CALLBACK_PORT = 8765;
 const MAX_QUERY_BYTES = 8192;
 const LOG_DEDUPE_MS = 10 * 60 * 1000;
 const SECURITY_TIMEOUT_MS = 15000;
+const EXCHANGE_TIMEOUT_MS = 60000;
 // `security -i` reads stdin line by line and silently cuts a line past 4096
 // bytes while still exiting 0, so a longer command goes straight to the file.
 const KEYCHAIN_COMMAND_LIMIT = 4000;
+// The account name reaches a shell-ish command line and a file name.
+const ACCOUNT_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 const STATE_PATH = join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "mcp-oauth");
 
 function timeoutMs() {
@@ -48,6 +51,11 @@ const EMPTY_STATE = () => ({
 	authorizationServerUrl: null,
 	resourceUrl: null
 });
+
+/** Stored state is plain JSON, so a round trip is a safe snapshot. */
+function clone(value) {
+	return value === null || value === void 0 ? null : JSON.parse(JSON.stringify(value));
+}
 
 /** Loaded on demand so the module can be imported (and tested) without the SDK. */
 let sdkAuth;
@@ -93,35 +101,121 @@ function run(command, args, input) {
 		};
 		const timer = setTimeout(() => {
 			child.kill("SIGKILL");
-			finish(reject, new Error(`${command} timed out after ${SECURITY_TIMEOUT_MS}ms`));
+			const error = new Error(`${command} timed out after ${SECURITY_TIMEOUT_MS}ms`);
+			error.stderr = stderr;
+			finish(reject, error);
 		}, SECURITY_TIMEOUT_MS);
 		timer.unref?.();
 		child.stdout.on("data", (chunk) => stdout += chunk);
 		child.stderr.on("data", (chunk) => stderr += chunk);
-		child.on("error", (error) => finish(reject, error));
-		child.on("close", (code) => code === 0 ? finish(resolve, stdout) : finish(reject, new Error(`${command} exited ${code}: ${stderr.trim()}`)));
+		child.on("error", (error) => {
+			// Keep `code` (ENOENT) so callers can tell a missing tool from a refusal.
+			error.stderr = stderr;
+			finish(reject, error);
+		});
+		child.on("close", (code) => {
+			if (code === 0) {
+				finish(resolve, stdout);
+				return;
+			}
+			const error = new Error(`${command} exited ${code}: ${stderr.trim()}`);
+			error.exitCode = code;
+			error.stderr = stderr;
+			finish(reject, error);
+		});
 		child.stdin.on("error", () => {});
 		child.stdin.end(input ?? "");
 	});
 }
 
-async function readKeychainItem(account) {
+function keychainFailure(action, error) {
+	const failure = new Error(`security ${action} failed: ${String(error.message ?? error)}`);
+	failure.name = "KeychainUnknown";
+	failure.exitCode = error.exitCode;
+	failure.stderr = error.stderr ?? "";
+	if (error.code) failure.code = error.code;
+	return failure;
+}
+
+/**
+ * `security find-generic-password` with three legal outcomes. Anything else is
+ * an unknown Keychain failure and is thrown, never read as "no record".
+ */
+async function readKeychainStatus(account) {
 	try {
 		const stdout = await run("security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]);
-		const encoded = stdout.trim();
-		return encoded ? Buffer.from(encoded, "base64").toString("utf8") : null;
-	} catch {
-		return null;
+		return { value: Buffer.from(stdout.trim(), "base64").toString("utf8") };
+	} catch (error) {
+		if (error.code === "ENOENT") return { unavailable: true };
+		if (error.exitCode === 44) return { absent: true };
+		throw keychainFailure("find-generic-password", error);
 	}
 }
 
+/**
+ * Remove the Keychain entry. Code 44 means it was already absent, and a missing
+ * `security` is a machine without a Keychain; both are normal. Every other
+ * failure is fatal so a caller cannot mistake it for a successful removal.
+ */
+export async function removeKeychainEntry(account) {
+	try {
+		await run("security", ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account]);
+		return "gone";
+	} catch (error) {
+		if (error.code === "ENOENT") return "unavailable";
+		if (error.exitCode === 44) return "gone";
+		throw keychainFailure("delete-generic-password", error);
+	}
+}
+
+/** Reading for display must not throw on an unknown Keychain failure. */
 async function readStores(account) {
-	const keychain = await readKeychainItem(account);
+	let keychain = null;
+	try {
+		const status = await readKeychainStatus(account);
+		keychain = "value" in status ? status.value : null;
+	} catch {}
 	let file = null;
 	try {
 		file = await readFile(join(STATE_PATH, `${account}.json`), "utf8");
 	} catch {}
 	return { keychain, file };
+}
+
+/** Reading before a write is strict: an unknown error must stop the save. */
+async function readStoresStrict(account) {
+	const status = await readKeychainStatus(account);
+	const keychain = "value" in status ? status.value : null;
+	let file = null;
+	try {
+		file = await readFile(join(STATE_PATH, `${account}.json`), "utf8");
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+	}
+	return { keychain, file };
+}
+
+/** A broken or foreign store is dropped rather than merged. */
+function parseStore(raw) {
+	if (typeof raw !== "string" || raw.length === 0) return null;
+	try {
+		const parsed = JSON.parse(raw);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Merge every readable store, but only after dropping one issued for another
+ * resource: its values must not fill a null field of this resource.
+ */
+function mergeFiltered(raws, serverUrl) {
+	const kept = raws
+		.map(parseStore)
+		.filter((state) => state !== null)
+		.filter((state) => !state.resourceUrl || state.resourceUrl === serverUrl);
+	return mergeStores(...kept.map((state) => JSON.stringify(state))) ?? EMPTY_STATE();
 }
 
 /**
@@ -151,14 +245,46 @@ export function mergeStores(keychain, file) {
 	return merged;
 }
 
-/** Remove the Keychain entry only; the file store is a separate copy. */
-async function deleteKeychainItem(account) {
-	await run("security", ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account]).catch(() => {});
+/** The state directory holds credential copies and must stay private. */
+async function ensureStateDir() {
+	await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
+	await chmod(STATE_PATH, 0o700).catch(() => {});
+}
+
+/** Remove the file copy; a missing file is the only tolerated failure. */
+async function removeFileCopy(account) {
+	const path = join(STATE_PATH, `${account}.json`);
+	try {
+		await rm(path);
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+	}
+}
+
+/** Remove temporaries a crashed write may have left for this account. */
+async function sweepTemporaries(account) {
+	let names;
+	try {
+		names = await readdir(STATE_PATH);
+	} catch (error) {
+		if (error.code === "ENOENT") return;
+		throw error;
+	}
+	const prefix = `${account}.json.`;
+	for (const name of names) {
+		if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+		try {
+			await rm(join(STATE_PATH, name));
+		} catch (error) {
+			if (error.code !== "ENOENT") throw error;
+		}
+	}
 }
 
 /** Replace the file copy atomically, readable by its owner only. */
 async function writeFileStore(account, value) {
-	await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
+	await ensureStateDir();
+	await sweepTemporaries(account);
 	const target = join(STATE_PATH, `${account}.json`);
 	const temporary = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
 	try {
@@ -171,38 +297,83 @@ async function writeFileStore(account, value) {
 	return target;
 }
 
+/**
+ * S order: remove the Keychain entry, remove the file copy, add to the Keychain
+ * and verify, then fall back to the file. A failed removal aborts before the
+ * new value is written, so no second live copy is created by accident.
+ *
+ * The add is not atomic with its exit status: `security -i` can store the value
+ * and still exit non-zero (killed at the deadline, a late error). After such a
+ * failure the Keychain is read back before any fallback: the matching value
+ * means the add landed and the Keychain holds the only copy; only a missing
+ * record proves nothing was written and allows the file. A helper that
+ * vanishes after the attempt proves nothing — the add may have landed — so it
+ * aborts the save together with a different value or an unreadable Keychain,
+ * because a second live copy would hide which secret the next read returns.
+ */
 async function writeSecret(account, value) {
 	const encoded = Buffer.from(value, "utf8").toString("base64");
 	const command = `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${account} -w ${encoded}`;
-	if (Buffer.byteLength(command, "utf8") >= KEYCHAIN_COMMAND_LIMIT) {
-		const target = await writeFileStore(account, value);
-		// A stale Keychain copy would win over the file on the next read.
-		await deleteKeychainItem(account);
-		log(`store:${account}`, `${account}: credential does not fit one security command line; kept at ${target} with mode 0600`);
-		return "file";
-	}
-	try {
-		await run("security", ["-i"], `${command}\n`);
-	} catch (error) {
-		const target = await writeFileStore(account, value);
-		log(`store:${account}`, `${account}: Keychain unavailable (${String(error).split("\n")[0]}); credentials kept at ${target} with mode 0600`);
-		return "file";
-	}
-	const stored = await readKeychainItem(account);
-	if (stored !== value) {
-		await deleteKeychainItem(account);
+	const oversized = Buffer.byteLength(command, "utf8") >= KEYCHAIN_COMMAND_LIMIT;
+	const status = await removeKeychainEntry(account);
+	await removeFileCopy(account);
+	if (status !== "unavailable" && !oversized) {
+		try {
+			await run("security", ["-i"], `${command}\n`);
+		} catch (error) {
+			let stored;
+			try {
+				stored = await readKeychainStatus(account);
+			} catch (readError) {
+				const failure = keychainFailure("add-generic-password", error);
+				failure.message = `${failure.message}; the Keychain state is unknown after the failed add (${String(readError.message ?? readError)}), so no file copy was written`;
+				throw failure;
+			}
+			if ("value" in stored) {
+				if (stored.value === value) {
+					log(`store:${account}`, `${account}: the Keychain add reported an error but holds the new value; keeping the single Keychain copy`);
+					return "keychain";
+				}
+				const failure = keychainFailure("add-generic-password", error);
+				failure.message = `${failure.message}; the Keychain holds a different value after the failed add, so no file copy was written`;
+				throw failure;
+			}
+			if (!stored.absent) {
+				const failure = keychainFailure("add-generic-password", error);
+				failure.message = `${failure.message}; security(1) vanished after the add was attempted, so whether the Keychain received the value cannot be verified, and no file copy was written`;
+				throw failure;
+			}
+			const target = await writeFileStore(account, value);
+			log(`store:${account}`, `${account}: Keychain unavailable (${String(error.message ?? error).split("\n")[0]}); credentials kept at ${target} with mode 0600`);
+			return "file";
+		}
+		const stored = await readKeychainStatus(account);
+		if ("value" in stored) {
+			if (stored.value === value) return "keychain";
+			// The old value must be gone before a file copy appears, or two live
+			// copies exist. An unconfirmed removal is an unknown state, not a pass.
+			const removal = await removeKeychainEntry(account);
+			if (removal !== "gone") {
+				const failure = new Error("security(1) vanished while removing the mismatched Keychain entry, so the old value may still be there and no file copy was written");
+				failure.name = "KeychainUnknown";
+				throw failure;
+			}
+		} else if (!stored.absent) {
+			// The add reported success, but a vanished helper cannot confirm it:
+			// the value may sit in the Keychain, so a file copy would be a second one.
+			const failure = new Error("security(1) vanished after the add reported success, so whether the Keychain received the value cannot be verified, and no file copy was written");
+			failure.name = "KeychainUnknown";
+			throw failure;
+		}
 		const target = await writeFileStore(account, value);
 		log(`store:${account}`, `${account}: Keychain returned a different value after the write; removed that entry and kept credentials at ${target} with mode 0600`);
 		return "file";
 	}
-	return "keychain";
-}
-
-/** Revocation must remove every copy: a surviving file would resurrect the secret. */
-async function clearSecret(account) {
-	const path = join(STATE_PATH, `${account}.json`);
-	await rm(path, { force: true }).catch(() => {});
-	await deleteKeychainItem(account);
+	const target = await writeFileStore(account, value);
+	log(`store:${account}`, status === "unavailable"
+		? `${account}: security(1) is unavailable; credentials kept at ${target} with mode 0600`
+		: `${account}: credential does not fit one security command line; kept at ${target} with mode 0600`);
+	return "file";
 }
 
 /** Serialize writes per account so two concurrent saves cannot interleave. */
@@ -236,7 +407,7 @@ function escapeHtml(value) {
  */
 async function writeAuthorizeLink(account, href) {
 	try {
-		await mkdir(STATE_PATH, { recursive: true, mode: 0o700 });
+		await ensureStateDir();
 		const path = join(STATE_PATH, `${account}.authorize.txt`);
 		await writeFile(path, `${href}\n`, { mode: 0o600 });
 		await chmod(path, 0o600);
@@ -262,9 +433,11 @@ export class CallbackHub {
 		this.binding = new Promise((resolve, reject) => {
 			const server = createServer((request, response) => this.#handle(request, response));
 			server.on("error", (error) => {
-				const failure = error.code === "EADDRINUSE"
-					? new Error(`callback port ${this.port} is busy — another DSH window or a stale process holds it; close it or set a different oauth.callbackPort for this server`)
-					: error;
+				let failure = error;
+				if (error.code === "EADDRINUSE") {
+					failure = new Error(`callback port ${this.port} is busy — another DSH window or a stale process holds it; close it or set a different oauth.callbackPort for this server`);
+					failure.code = "EADDRINUSE";
+				}
 				this.error = failure;
 				this.server = null;
 				this.binding = null;
@@ -426,8 +599,34 @@ function allowBrowser(serverName) {
 }
 
 export function createOAuthProvider({ serverName, serverUrl, oauth }) {
+	if (typeof serverName !== "string" || !ACCOUNT_PATTERN.test(serverName)) {
+		throw new Error(`invalid server name ${JSON.stringify(serverName)}: use 1-32 characters from A-Z, a-z, 0-9, "_" or "-"`);
+	}
 	const port = Number(oauth?.callbackPort ?? DEFAULT_CALLBACK_PORT);
 	return new KeychainOAuthProvider({ serverName, serverUrl, oauth, hub: hubFor(port) });
+}
+
+/**
+ * Race a promise against a deadline. The original promise gets a no-op
+ * rejection handler before the race, so a late rejection is never unhandled.
+ */
+export function withDeadline(promise, ms) {
+	promise.catch(() => {});
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (fn, value) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			fn(value);
+		};
+		const timer = setTimeout(() => {
+			const error = new Error(`operation did not finish within ${ms}ms`);
+			error.code = "EDEADLINE";
+			finish(reject, error);
+		}, ms);
+		promise.then((value) => finish(resolve, value), (error) => finish(reject, error));
+	});
 }
 
 class KeychainOAuthProvider {
@@ -437,15 +636,16 @@ class KeychainOAuthProvider {
 		this.oauth = oauth;
 		this.hub = hub;
 		this.store = null;
+		this.persisted = null;
 		this.dirty = new Set();
 	}
 
 	async load() {
 		if (this.store) return this.store;
 		const { keychain, file } = await readStores(this.serverName);
-		const merged = mergeStores(keychain, file);
-		let state = merged ?? EMPTY_STATE();
-		// A credential issued for another resource is never reused.
+		let state = mergeFiltered([keychain, file], this.serverUrl);
+		// A single foreign store is already filtered above; keep the guard for the
+		// merged result as well.
 		if (state.resourceUrl && state.resourceUrl !== this.serverUrl) {
 			log(`resource:${this.serverName}`, `${this.serverName}: stored credential belongs to ${state.resourceUrl}, ignoring it for ${this.serverUrl}`);
 			state = EMPTY_STATE();
@@ -458,6 +658,8 @@ class KeychainOAuthProvider {
 			this.dirty.add("clientInformation");
 		}
 		this.store = state;
+		// Rollback must return to the state after these checks, not the raw read.
+		this.persisted = clone(state);
 		return this.store;
 	}
 
@@ -465,18 +667,34 @@ class KeychainOAuthProvider {
 	 * Read-merge-write under a per-account queue: only the fields this provider
 	 * changed are applied, so a reconnect that holds a stale snapshot cannot
 	 * erase a token another provider just stored.
+	 *
+	 * A failed write rolls the in-memory state back to the last saved one and
+	 * puts the changed keys back in `dirty`, so the same provider never serves a
+	 * value that was not stored and can retry.
 	 */
 	async persist() {
 		const changed = [...this.dirty];
 		if (changed.length === 0) return;
+		// Capture the values now: a later save can replace `this.store` while this
+		// one waits in the queue, and reading it there would write the older value
+		// of a field that overlapped.
 		const values = Object.fromEntries(changed.map((key) => [key, this.store[key]]));
-		this.dirty.clear();
 		await queueWrite(this.serverName, async () => {
-			const latest = mergeStores(...Object.values(await readStores(this.serverName))) ?? EMPTY_STATE();
-			for (const [key, value] of Object.entries(values)) latest[key] = value;
-			latest.resourceUrl = this.serverUrl;
-			await writeSecret(this.serverName, JSON.stringify(latest));
-			this.store = latest;
+			const snapshot = this.persisted ? clone(this.persisted) : null;
+			try {
+				const { keychain, file } = await readStoresStrict(this.serverName);
+				const base = mergeFiltered([keychain, file], this.serverUrl);
+				for (const [key, value] of Object.entries(values)) base[key] = value;
+				base.resourceUrl = this.serverUrl;
+				await writeSecret(this.serverName, JSON.stringify(base));
+				this.store = base;
+				this.persisted = clone(base);
+				for (const key of changed) this.dirty.delete(key);
+			} catch (error) {
+				this.store = snapshot ?? EMPTY_STATE();
+				for (const key of changed) this.dirty.add(key);
+				throw error;
+			}
 		});
 	}
 
@@ -558,15 +776,28 @@ class KeychainOAuthProvider {
 
 	async invalidateCredentials(scope) {
 		await this.load();
-		if (scope === "all" || scope === "tokens") this.store.tokens = null;
-		if (scope === "all" || scope === "client") this.store.clientInformation = null;
-		if (scope === "all") {
-			this.store.codeVerifier = null;
-			this.store.discoveryState = null;
+		if (scope === "tokens" || scope === "client") {
+			if (scope === "tokens") {
+				this.store.tokens = null;
+				this.dirty.add("tokens");
+			} else {
+				this.store.clientInformation = null;
+				this.dirty.add("clientInformation");
+			}
+			await this.persist();
+		} else if (scope === "all") {
+			// Revocation fails loudly when a copy cannot be removed. The removals run
+			// in the write queue, so a save already in flight cannot write the token
+			// back after the revocation has finished.
+			await queueWrite(this.serverName, async () => {
+				await removeKeychainEntry(this.serverName);
+				await removeFileCopy(this.serverName);
+				await sweepTemporaries(this.serverName);
+			});
+			this.store = EMPTY_STATE();
+			this.persisted = null;
+			this.dirty.clear();
 		}
-		await queueWrite(this.serverName, () => clearSecret(this.serverName));
-		this.store = EMPTY_STATE();
-		this.dirty.clear();
 		log(`invalidate:${this.serverName}`, `${this.serverName}: credentials cleared from every store (${scope})`);
 	}
 
@@ -613,20 +844,29 @@ class KeychainOAuthProvider {
 		}
 		log(`authorize:${this.serverName}`, `${this.serverName}: authorize at ${url.href}`);
 		if (manual) await writeAuthorizeLink(this.serverName, url.href);
-		if (!manual) spawn("open", [url.href], { stdio: "ignore", detached: true }).unref();
+		if (!manual) {
+			const child = spawn("open", [url.href], { stdio: "ignore", detached: true });
+			// A machine without `open` must not take the whole process down.
+			child.on("error", (error) => log(`open:${this.serverName}`, `${this.serverName}: could not open a browser (${String(error.message ?? error)}); open the authorization link from the DeepSeek Harness log`));
+			child.unref();
+		}
 		flow.promise
 			.then(async ({ code, iss, respond }) => {
 				try {
 					const auth = await loadAuth();
-					const outcome = await auth(this, {
+					const outcome = await withDeadline(auth(this, {
 						serverUrl: this.serverUrl,
 						authorizationCode: code,
 						...(iss ? { iss } : {})
-					});
+					}), EXCHANGE_TIMEOUT_MS);
 					respond(200, `<p><b>${escapeHtml(this.serverName)}</b>: ${outcome === "AUTHORIZED" ? "authorized. You can close this tab." : `${escapeHtml(outcome)}. Check the DeepSeek Harness log.`}</p>`);
 					log(`result:${this.serverName}`, `${this.serverName}: authorization ${outcome}`);
 				} catch (error) {
-					respond(500, `<p><b>${escapeHtml(this.serverName)}</b>: the token exchange failed — see the DeepSeek Harness log.</p>`);
+					if (error?.code === "EDEADLINE") {
+						respond(504, `<p><b>${escapeHtml(this.serverName)}</b>: the token exchange did not finish within ${Math.round(EXCHANGE_TIMEOUT_MS / 1000)} seconds. Close this tab and try again from DeepSeek Harness.</p>`);
+					} else {
+						respond(500, `<p><b>${escapeHtml(this.serverName)}</b>: the token exchange failed — see the DeepSeek Harness log.</p>`);
+					}
 					registry.blocked.set(this.serverName, Date.now() + RETRY_COOLDOWN_MS);
 					log(`failed:${this.serverName}`, `${this.serverName}: authorization failed: ${String(error.message ?? error)}; no automatic retry for 5 minutes`);
 				}
